@@ -75,6 +75,20 @@ def get_ufs():
     except Exception:
         return []
 
+# NOVA FUNÇÃO: Buscar cidades por UF
+@st.cache_data(show_spinner=False)
+def get_cidades(uf=None):
+    try:
+        if uf and uf != "Todos":
+            sql = "SELECT DISTINCT municipio FROM estabelecimento WHERE uf = %s AND municipio IS NOT NULL ORDER BY municipio"
+            result, _ = db.execute_query(sql, (uf,))
+        else:
+            sql = "SELECT DISTINCT municipio FROM estabelecimento WHERE municipio IS NOT NULL ORDER BY municipio"
+            result, _ = db.execute_query(sql)
+        return [r[0] for r in result] if result else []
+    except Exception:
+        return []
+
 @st.cache_data(show_spinner=False)
 def get_portes():
     try:
@@ -171,40 +185,38 @@ def sugerir_cnae_cache(termo: str, limit: int = SUGGEST_LIMIT):
     res2, _ = db.execute_query(_sql_sugerir_cnae_fallback(), (f"%{termo}%", limit))
     return res2 or []
 
-def sugerir_razao_social(termo: str, limit: int = 12):
+# NOVA FUNÇÃO: Buscar sugestões unificadas para Razão Social e Nome Fantasia
+@st.cache_data(ttl=600, show_spinner=False)
+def sugerir_nome_empresa(termo: str, limit: int = 12):
     if not termo or len(termo.strip()) < 2:
         return []
+    
     sql = """
-        SELECT emp.razao_social, COUNT(*) AS qtd
-        FROM empresa emp
-        JOIN estabelecimento est USING (cnpj_basico)
-        WHERE emp.razao_social ILIKE %s
-        GROUP BY emp.razao_social
-        ORDER BY qtd DESC, emp.razao_social
+        (
+            SELECT emp.razao_social AS nome, 'Razão Social' AS tipo, COUNT(*) AS qtd
+            FROM empresa emp
+            JOIN estabelecimento est USING (cnpj_basico)
+            WHERE emp.razao_social ILIKE %s
+            GROUP BY emp.razao_social
+        )
+        UNION ALL
+        (
+            SELECT est.nome_fantasia AS nome, 'Nome Fantasia' AS tipo, COUNT(*) AS qtd
+            FROM estabelecimento est
+            WHERE est.nome_fantasia ILIKE %s
+            GROUP BY est.nome_fantasia
+        )
+        ORDER BY qtd DESC, nome
         LIMIT %s
     """
-    res, _ = db.execute_query(sql, (f"%{termo.strip()}%", limit))
-    return res or []
-
-def sugerir_nome_fantasia(termo: str, limit: int = 12):
-    if not termo or len(termo.strip()) < 2:
-        return []
-    sql = """
-        SELECT est.nome_fantasia, COUNT(*) AS qtd
-        FROM estabelecimento est
-        WHERE est.nome_fantasia ILIKE %s
-        GROUP BY est.nome_fantasia
-        ORDER BY qtd DESC, est.nome_fantasia
-        LIMIT %s
-    """
-    res, _ = db.execute_query(sql, (f"%{termo.strip()}%", limit))
+    res, _ = db.execute_query(sql, (f"%{termo.strip()}%", f"%{termo.strip()}%", limit))
     return res or []
 
 if "filtros" not in st.session_state:
     st.session_state.filtros = {
         "cnpj": "",
-        "razao_social": "",
-        "nome_fantasia": "",
+        "nome_empresa": "",  # CAMPO UNIFICADO
+        "cidade": "Todos",   # NOVO CAMPO: Cidade
         "uf": "Todos",
         "porte": "Todos",
         "situacao": "Todos",
@@ -234,12 +246,18 @@ def build_queries(filtros: dict, limit: int = None, offset: int = None):
     if filtros["cnpj"]:
         base_where += " AND est.cnpj ILIKE %s"
         params.append(f"%{filtros['cnpj']}%")
-    if filtros["razao_social"]:
-        base_where += " AND emp.razao_social ILIKE %s"
-        params.append(f"%{filtros['razao_social']}%")
-    if filtros["nome_fantasia"]:
-        base_where += " AND est.nome_fantasia ILIKE %s"
-        params.append(f"%{filtros['nome_fantasia']}%")
+    
+    # MODIFICAÇÃO: Campo unificado para Razão Social e Nome Fantasia
+    if filtros["nome_empresa"]:
+        base_where += " AND (emp.razao_social ILIKE %s OR est.nome_fantasia ILIKE %s)"
+        params.append(f"%{filtros['nome_empresa']}%")
+        params.append(f"%{filtros['nome_empresa']}%")
+    
+    # NOVO FILTRO: Cidade
+    if filtros["cidade"] != "Todos":
+        base_where += " AND est.municipio = %s"
+        params.append(filtros["cidade"])
+    
     if filtros["cnae"] and "Todos" not in filtros["cnae"]:
         placeholders = ", ".join(["%s"] * len(filtros["cnae"]))
         base_where += f" AND est.cnae_fiscal_principal::text IN ({placeholders})"
@@ -301,15 +319,29 @@ with st.sidebar.form("filtros_form", clear_on_submit=False):
     st.subheader("Filtros de Pesquisa")
 
     cnpj_input = st.text_input("CNPJ (completo ou parcial)", value=st.session_state.filtros.get("cnpj", ""))
-    razao_input = st.text_input("Razão Social (completo ou parcial)", value=st.session_state.filtros.get("razao_social", ""))
-    fantasia_input = st.text_input("Nome Fantasia (completo ou parcial)", value=st.session_state.filtros.get("nome_fantasia", ""))
+    
+    # CAMPO UNIFICADO: Substitui os dois campos anteriores
+    nome_empresa_input = st.text_input("Razão Social ou Nome Fantasia (completo ou parcial)", 
+                                      value=st.session_state.filtros.get("nome_empresa", ""))
+    
+    # Exibir sugestões para o campo unificado
+    if nome_empresa_input and len(nome_empresa_input.strip()) >= 2:
+        sugestoes = sugerir_nome_empresa(nome_empresa_input.strip())
+        if sugestoes:
+            st.caption("Sugestões:")
+            for nome, tipo, qtd in sugestoes[:5]:  # Mostrar apenas as 5 primeiras
+                st.markdown(f"<small>• {nome} <em>({tipo}, {qtd} empresas)</em></small>", unsafe_allow_html=True)
 
-    st.markdown("**CNAE**")
-    c1, c2 = st.columns([0.65, 0.35])
-    with c1:
-        cnae_busca = st.text_input("Buscar por descrição (ex.: sorveteria)", value="", key="cnae_busca_texto")
-    with c2:
-        buscar = st.form_submit_button("🔎 Buscar CNAE")
+    # NOVO CAMPO: Cidade (abaixo do campo unificado)
+    cidades = ["Todos"] + get_cidades()
+    cidade_select = st.selectbox("Cidade", options=cidades, index=cidades.index(st.session_state.filtros.get("cidade", "Todos")))
+
+    st.markdown("**CNAE // Busca por descrição (ex.: sorveteria)**")
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        cnae_busca = st.text_input("Buscar por descrição (ex.: sorveteria)", value="", key="cnae_busca_texto", label_visibility="collapsed")
+    with col2:
+        buscar = st.form_submit_button("🔎", use_container_width=True, help="Buscar CNAE")
 
     if buscar and len(cnae_busca.strip()) >= 3:
         st.session_state.cnae_resultados = sugerir_cnae_cache(cnae_busca.strip())
@@ -321,9 +353,8 @@ with st.sidebar.form("filtros_form", clear_on_submit=False):
         st.multiselect("Resultados da busca", options=options, key=ms_key)
     selected_items = st.session_state.get(ms_key, [])
 
-    col_add1, col_add2 = st.columns([0.5, 0.5])
-    add_selecionados = col_add1.form_submit_button("➕ Adicionar selecionados")
-    limpar_selec = col_add2.form_submit_button("🧹 Limpar seleção")
+    add_selecionados = st.form_submit_button("➕ Adicionar selecionados", use_container_width=True)
+    limpar_selec = st.form_submit_button("🧹 Limpar seleção", use_container_width=True)
 
     if add_selecionados and selected_items:
         for item in selected_items:
@@ -361,10 +392,9 @@ with st.sidebar.form("filtros_form", clear_on_submit=False):
                                            int(st.session_state.filtros.get("capital_max", cap_max))))
     limit_slider = st.slider("Resultados por página", 10, 500, st.session_state.filtros.get("limit", 100))
 
-    cta1, cta2, cta3 = st.columns(3)
-    atualizar_contagem = cta1.form_submit_button("📊 Atualizar contagem")
-    executar_consulta = cta2.form_submit_button("🔍 Executar consulta")
-    limpar_tudo = cta3.form_submit_button("🧹 Limpar filtros")
+    atualizar_contagem = st.form_submit_button("📊 Atualizar contagem", use_container_width=True)
+    executar_consulta = st.form_submit_button("🔍 Executar consulta", use_container_width=True)
+    limpar_tudo = st.form_submit_button("🧹 Limpar filtros", use_container_width=True)
 
 with st.sidebar:
     st.markdown("---")
@@ -400,8 +430,8 @@ with st.sidebar:
 
 f_preview = {
     "cnpj": cnpj_input.strip(),
-    "razao_social": razao_input.strip(),
-    "nome_fantasia": fantasia_input.strip(),
+    "nome_empresa": nome_empresa_input.strip(),  # CAMPO UNIFICADO
+    "cidade": cidade_select,  # NOVO CAMPO
     "uf": uf_select,
     "porte": porte_select,
     "situacao": situacao_select,
@@ -427,7 +457,8 @@ if total_empresas is not None:
 
 if limpar_tudo:
     st.session_state.filtros = {
-        "cnpj": "", "razao_social": "", "nome_fantasia": "",
+        "cnpj": "", "nome_empresa": "",  # CAMPO UNIFICADO
+        "cidade": "Todos",  # NOVO CAMPO
         "uf": "Todos", "porte": "Todos", "situacao": "Todos",
         "cnae": [], "capital_min": 0, "capital_max": 500000,
         "sem_limite_capital": False, "limit": 100
@@ -448,8 +479,8 @@ if executar_consulta:
 def _chips_aplicados(f):
     chips = []
     if f["cnpj"]: chips.append(f"<span class='badge badge-applied'><small>CNPJ</small> {f['cnpj']}</span>")
-    if f["razao_social"]: chips.append(f"<span class='badge badge-applied'><small>Razão</small> {f['razao_social']}</span>")
-    if f["nome_fantasia"]: chips.append(f"<span class='badge badge-applied'><small>Fantasia</small> {f['nome_fantasia']}</span>")
+    if f["nome_empresa"]: chips.append(f"<span class='badge badge-applied'><small>Nome Empresa</small> {f['nome_empresa']}</span>")
+    if f["cidade"] != "Todos": chips.append(f"<span class='badge badge-applied'><small>Cidade</small> {f['cidade']}</span>")
     if f["uf"] != "Todos": chips.append(f"<span class='badge badge-applied'><small>UF</small> {f['uf']}</span>")
     if f["porte"] != "Todos": chips.append(f"<span class='badge badge-applied'><small>Porte</small> {f['porte']}</span>")
     if f["situacao"] != "Todos": chips.append(f"<span class='badge badge-applied'><small>Situação</small> {f['situacao']}</span>")
@@ -465,6 +496,8 @@ def _chips_aplicados(f):
 st.markdown("#### Filtros aplicados")
 st.markdown(_chips_aplicados(st.session_state.filtros), unsafe_allow_html=True)
 st.markdown("---")
+
+# ... (código anterior permanece igual) ...
 
 if st.session_state.consulta_pronta:
     f = st.session_state.filtros
@@ -518,13 +551,53 @@ if st.session_state.consulta_pronta:
 
                 st.dataframe(df_exibicao, use_container_width=True, hide_index=True, height=440)
 
-                csv = df.to_csv(index=False, sep=";", decimal=",")
-                href = f"""<a href="data:file/csv;base64,{base64.b64encode(csv.encode()).decode()}" download="empresas_pagina_{page}.csv">
-                            <button style="background-color:#4CAF50; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer;">
-                                📥 Download CSV (página)
-                            </button>
-                        </a>"""
-                st.markdown(href, unsafe_allow_html=True)
+                # BOTÕES DE DOWNLOAD - MODIFICAÇÃO AQUI
+                col_download1, col_download2 = st.columns(2)
+                
+                with col_download1:
+                    # Download da página atual
+                    csv_page = df.to_csv(index=False, sep=";", decimal=",")
+                    href_page = f"""<a href="data:file/csv;base64,{base64.b64encode(csv_page.encode()).decode()}" download="empresas_pagina_{page}.csv">
+                                <button style="background-color:#4CAF50; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer; width:100%;">
+                                    📥 Download CSV (página)
+                                </button>
+                            </a>"""
+                    st.markdown(href_page, unsafe_allow_html=True)
+                
+                with col_download2:
+                    # Download de todos os resultados
+                    if st.button("📥 Download CSV (todos)", use_container_width=True, key="download_todos"):
+                        with st.spinner("Gerando arquivo com todos os resultados..."):
+                            try:
+                                # Buscar todos os resultados sem limite
+                                (_, _), (sql_all, params_all) = build_queries(f)
+                                # Remover LIMIT e OFFSET da query
+                                sql_all = sql_all.replace("LIMIT %s OFFSET %s", "")
+                                # Remover os últimos 2 parâmetros (limit e offset)
+                                params_all = params_all[:-2]
+                                
+                                resultados_all, _ = db.execute_query(sql_all, params_all)
+                                if resultados_all:
+                                    df_all = pd.DataFrame(resultados_all, columns=colunas)
+                                    
+                                    # Aplicar as mesmas formatações
+                                    if "cnpj" in df_all.columns:
+                                        df_all["cnpj_formatado"] = df_all["cnpj"].apply(formatar_cnpj)
+                                    if "capital_social" in df_all.columns:
+                                        df_all["capital_social_formatado"] = df_all["capital_social"].apply(formatar_moeda)
+                                    if "porte_empresa" in df_all.columns:
+                                        df_all["porte_traduzido"] = df_all["porte_empresa"].apply(traduzir_porte)
+                                    
+                                    csv_all = df_all.to_csv(index=False, sep=";", decimal=",")
+                                    
+                                    # Criar link de download
+                                    href_all = f'<a href="data:file/csv;base64,{base64.b64encode(csv_all.encode()).decode()}" download="empresas_todos.csv">Download pronto</a>'
+                                    st.markdown(href_all, unsafe_allow_html=True)
+                                    st.success(f"Arquivo gerado com {len(df_all)} registros!")
+                                else:
+                                    st.warning("Nenhum resultado para exportar.")
+                            except Exception as e:
+                                st.error(f"Erro ao gerar arquivo completo: {e}")
 
                 (sql_count, params_count), _ = build_queries(f)
                 res_total, _ = db.execute_query(sql_count, params_count)
@@ -658,12 +731,6 @@ if buscar_detalhes and cnpj_detalhes:
                         st.write(f"**CEP:** {cep_fmt}")
                         compl = df_d.get('complemento', pd.Series(['N/A'])).iloc[0]
                         st.write(f"**Complemento:** {compl}")
-                        st.write("**Informações de Contato**")
-                        ddd = str(df_d.get('ddd_1', pd.Series([''])).iloc[0] or '')
-                        tel = str(df_d.get('telefone_1', pd.Series(['N/A'])).iloc[0] or 'N/A')
-                        st.write(f"**Telefone:** ({ddd}) {tel}")
-                        email = df_d.get('correio_eletronico', pd.Series(['N/A'])).iloc[0]
-                        st.write(f"**Email:** {email}")
                 else:
                     st.warning("Nenhuma empresa encontrada com este CNPJ.")
             except Exception as e:
